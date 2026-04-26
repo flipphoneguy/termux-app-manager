@@ -1,0 +1,636 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# tam — Termux App Manager
+# Interactive + scriptable wrapper over pm / am / cmd / IFW for rooted Termux.
+
+set -o pipefail
+shopt -s nocasematch
+
+VERSION=0.1.0
+IFW_DIR=/data/system/ifw
+EXTRACT_DEFAULT="$PWD"
+
+# ---------- colors ----------
+if [[ -t 1 && -z $NO_COLOR ]]; then
+    C_R=$'\e[0m'; C_B=$'\e[1m'; C_DIM=$'\e[2m'
+    C_RED=$'\e[31m'; C_GRN=$'\e[32m'; C_YEL=$'\e[33m'
+    C_BLU=$'\e[34m'; C_MAG=$'\e[35m'; C_CYN=$'\e[36m'
+else
+    C_R= C_B= C_DIM= C_RED= C_GRN= C_YEL= C_BLU= C_MAG= C_CYN=
+fi
+
+msg()  { printf '%s\n' "$*" >&2; }
+info() { printf '%s%s%s\n' "$C_CYN" "$*" "$C_R" >&2; }
+ok()   { printf '%s✓ %s%s\n' "$C_GRN" "$*" "$C_R" >&2; }
+warn() { printf '%s! %s%s\n' "$C_YEL" "$*" "$C_R" >&2; }
+err()  { printf '%s✗ %s%s\n' "$C_RED" "$*" "$C_R" >&2; }
+die()  { err "$*"; exit 1; }
+
+# ---------- sudo ----------
+have_sudo=0
+ensure_sudo() {
+    (( have_sudo )) && return 0
+    command -v sudo >/dev/null || die "sudo not found (install tsu/sudo)"
+    sudo -n true 2>/dev/null || sudo true || die "sudo failed"
+    have_sudo=1
+}
+s() { ensure_sudo; sudo "$@"; }
+
+# ---------- package picker ----------
+# pm_list [filter-flag]
+#   default: all packages
+#   -3 third-party, -s system, -d disabled, -e enabled
+pm_list() {
+    s pm list packages "$@" 2>/dev/null | sed 's/^package://' | sort -u
+}
+
+# pick_pkg <partial-or-empty>  → echoes the chosen package name
+pick_pkg() {
+    local query=${1-} all matches
+    all=$(pm_list)
+    [[ -z $all ]] && die "no packages returned by pm"
+
+    if [[ -n $query ]]; then
+        # exact match wins immediately
+        if grep -qx "$query" <<<"$all"; then
+            printf '%s\n' "$query"; return 0
+        fi
+        matches=$(grep -i -- "$query" <<<"$all")
+    else
+        matches=$all
+    fi
+
+    [[ -z $matches ]] && die "no packages match: $query"
+
+    if [[ $(wc -l <<<"$matches") -eq 1 ]]; then
+        printf '%s\n' "$matches"; return 0
+    fi
+
+    if command -v fzf >/dev/null && [[ -t 0 && -t 2 ]]; then
+        local pick
+        pick=$(fzf --prompt="package> " --height=40% --reverse \
+                   --query="$query" --select-1 --exit-0 <<<"$matches") \
+            || die "no package picked"
+        printf '%s\n' "$pick"; return 0
+    fi
+
+    # numbered fallback menu
+    local -a list; mapfile -t list <<<"$matches"
+    local i; for i in "${!list[@]}"; do
+        printf '%s%3d%s  %s\n' "$C_DIM" "$((i+1))" "$C_R" "${list[i]}" >&2
+    done
+    local n
+    read -rp "select [1-${#list[@]}]: " n </dev/tty
+    [[ $n =~ ^[0-9]+$ ]] && (( n>=1 && n<=${#list[@]} )) || die "bad selection"
+    printf '%s\n' "${list[$((n-1))]}"
+}
+
+# pick_one <prompt> <items-stdin>
+pick_one() {
+    local prompt=$1
+    local items; items=$(cat)
+    [[ -z $items ]] && return 1
+    if [[ $(wc -l <<<"$items") -eq 1 ]]; then
+        printf '%s\n' "$items"; return 0
+    fi
+    if command -v fzf >/dev/null && [[ -t 0 && -t 2 ]]; then
+        fzf --prompt="$prompt> " --height=60% --reverse --select-1 --exit-0 <<<"$items"
+        return $?
+    fi
+    local -a list; mapfile -t list <<<"$items"
+    local i; for i in "${!list[@]}"; do
+        printf '%s%3d%s  %s\n' "$C_DIM" "$((i+1))" "$C_R" "${list[i]}" >&2
+    done
+    local n
+    read -rp "$prompt [1-${#list[@]}]: " n </dev/tty
+    [[ $n =~ ^[0-9]+$ ]] && (( n>=1 && n<=${#list[@]} )) || return 1
+    printf '%s\n' "${list[$((n-1))]}"
+}
+
+# ---------- component listing ----------
+# Components come from `pm dump`. The output groups by Activity/Receiver/
+# Service/Provider Resolver Table and lists "<pkg>/<class>" lines.
+# We also fall back to aapt for the raw manifest (gets non-resolver components).
+
+# list_components <pkg> <kind:activity|receiver|service|provider|all>
+list_components() {
+    local pkg=$1 kind=${2:-all} dump
+    dump=$(s pm dump "$pkg" 2>/dev/null) || return 1
+
+    _section() {
+        # _section <start-regex> <end-regex>
+        awk -v s="$1" -v e="$2" '
+            $0 ~ s {on=1; next}
+            on && $0 ~ e {on=0}
+            on
+        ' <<<"$dump"
+    }
+    _grep_comps() {
+        grep -oE "$pkg/[A-Za-z0-9_.\$]+" | awk '{print $1}' | sort -u
+    }
+
+    case $kind in
+        activity)  _section '^Activity Resolver Table:' '^(Receiver|Service|Provider) Resolver Table:|^Permissions:' | _grep_comps ;;
+        receiver)  _section '^Receiver Resolver Table:' '^(Service|Provider) Resolver Table:|^Permissions:' | _grep_comps ;;
+        service)   _section '^Service Resolver Table:'  '^(Provider) Resolver Table:|^Permissions:' | _grep_comps ;;
+        provider)  _section '^Provider Resolver Table:' '^Permissions:|^Key Set Manager:' | _grep_comps ;;
+        all)
+            { _section '^Activity Resolver Table:' '^(Receiver|Service|Provider) Resolver Table:|^Permissions:' | _grep_comps | sed 's/$/  [activity]/'
+              _section '^Receiver Resolver Table:' '^(Service|Provider) Resolver Table:|^Permissions:' | _grep_comps | sed 's/$/  [receiver]/'
+              _section '^Service Resolver Table:'  '^(Provider) Resolver Table:|^Permissions:' | _grep_comps | sed 's/$/  [service]/'
+              _section '^Provider Resolver Table:' '^Permissions:|^Key Set Manager:' | _grep_comps | sed 's/$/  [provider]/'
+            } | sort
+            ;;
+        *) die "unknown kind: $kind" ;;
+    esac
+}
+
+# launcher activity for a package, or empty
+main_activity() {
+    local pkg=$1
+    s cmd package query-activities -a android.intent.action.MAIN \
+        -c android.intent.category.LAUNCHER --components 2>/dev/null \
+        | awk -v p="$pkg/" 'index($0,p)==1' | head -1
+}
+
+# ---------- actions ----------
+act_info() {
+    local pkg=$1 dump path ver enabled uid target installer
+    path=$(s pm path "$pkg" 2>/dev/null | sed 's/^package://')
+    [[ -z $path ]] && die "not installed: $pkg"
+    dump=$(s pm dump "$pkg" 2>/dev/null)
+
+    # extract first match of key=value (no whitespace in value)
+    _f() { grep -oE "(^|[ ])$1=[^ ]+" <<<"$dump" | head -1 | sed -E "s/.*$1=//"; }
+    ver=$(_f versionName)
+    target=$(_f targetSdk)
+    uid=$(_f appId)
+    installer=$(_f installerPackageName)
+    # User 0 enabled value (0=default,1=enabled,2=disabled,3=disabled-user,4=disabled-until-used)
+    enabled=$(awk '/^[[:space:]]+User 0:/ {
+        for (i=1;i<=NF;i++) if ($i ~ /^enabled=/) { sub(/enabled=/,"",$i); print $i; exit }
+    }' <<<"$dump")
+    case $enabled in
+        0) enabled="0 (default)" ;;
+        1) enabled="1 (enabled)" ;;
+        2) enabled="2 (disabled)" ;;
+        3) enabled="3 (disabled-user)" ;;
+        4) enabled="4 (disabled-until-used)" ;;
+    esac
+
+    printf '%spackage%s    %s\n' "$C_B" "$C_R" "$pkg"
+    printf '%sversion%s    %s\n' "$C_B" "$C_R" "${ver:-?}"
+    printf '%senabled%s    %s\n' "$C_B" "$C_R" "${enabled:-?}"
+    printf '%sappId%s      %s\n' "$C_B" "$C_R" "${uid:-?}"
+    printf '%stargetSdk%s  %s\n' "$C_B" "$C_R" "${target:-?}"
+    [[ -n $installer && $installer != null ]] && printf '%sinstaller%s  %s\n' "$C_B" "$C_R" "$installer"
+    printf '%spath%s       %s\n' "$C_B" "$C_R" "$path"
+    local main; main=$(main_activity "$pkg")
+    [[ -n $main ]] && printf '%slauncher%s   %s\n' "$C_B" "$C_R" "$main"
+    if s test -f "$IFW_DIR/$pkg.xml"; then
+        printf '%sifw%s        %s\n' "$C_B" "$C_R" "$IFW_DIR/$pkg.xml"
+    fi
+}
+
+act_launch() {
+    local pkg=$1 comp=${2-}
+    if [[ -z $comp ]]; then
+        comp=$(main_activity "$pkg")
+        [[ -z $comp ]] && die "no launcher activity for $pkg"
+    fi
+    info "launching $comp"
+    s am start -n "$comp"
+}
+
+act_pick_activity() {
+    local pkg=$1 comp
+    comp=$(list_components "$pkg" activity | pick_one "activity") || die "cancelled"
+    act_launch "$pkg" "$comp"
+}
+
+act_components() {
+    local pkg=$1 kind=${2:-all}
+    list_components "$pkg" "$kind"
+}
+
+act_disable_pkg() {
+    local pkg=$1
+    s pm disable-user --user 0 "$pkg"
+}
+act_enable_pkg() {
+    local pkg=$1
+    s pm enable "$pkg"
+}
+act_hide() {
+    local pkg=$1
+    s pm hide "$pkg"
+}
+act_unhide() {
+    local pkg=$1
+    s pm unhide "$pkg"
+}
+act_suspend() {
+    local pkg=$1 onoff=${2:-true}
+    s pm suspend --user 0 "$pkg" "$onoff" 2>&1 || s pm suspend "$pkg"
+}
+
+act_disable_component() {
+    local comp=$1
+    s pm disable "$comp"
+}
+act_enable_component() {
+    local comp=$1
+    s pm enable "$comp"
+}
+
+act_force_stop() { s am force-stop "$1"; }
+act_kill()       { s am kill "$1"; }
+act_clear()      { s pm clear "$1"; }
+
+act_uninstall() {
+    local pkg=$1 keep=${2:-0}
+    if (( keep )); then
+        s pm uninstall -k --user 0 "$pkg"
+    else
+        s pm uninstall --user 0 "$pkg"
+    fi
+}
+
+act_install() {
+    local apk=$1
+    [[ -f $apk ]] || die "no such apk: $apk"
+    s pm install -r -g "$apk"
+}
+
+act_path() { s pm path "$1"; }
+
+act_extract() {
+    local pkg=$1 dest=${2:-$EXTRACT_DEFAULT} paths p out
+    paths=$(s pm path "$pkg" 2>/dev/null | sed 's/^package://')
+    [[ -z $paths ]] && die "not installed: $pkg"
+    mkdir -p "$dest" || die "cannot mkdir $dest"
+    while IFS= read -r p; do
+        [[ -z $p ]] && continue
+        out=$dest/$pkg-$(basename "$p")
+        info "→ $out"
+        s cat "$p" >"$out" || { err "failed: $p"; continue; }
+    done <<<"$paths"
+    ok "extracted to $dest"
+}
+
+act_settings() {
+    s am start -a android.settings.APPLICATION_DETAILS_SETTINGS \
+        -d "package:$1"
+}
+
+act_perms() {
+    local pkg=$1
+    s dumpsys package "$pkg" 2>/dev/null \
+        | awk '/runtime permissions:/,/^[A-Za-z]/' \
+        | grep -E 'android\.permission\.|granted='
+}
+
+act_grant()  { s pm grant  "$1" "$2"; }
+act_revoke() { s pm revoke "$1" "$2"; }
+
+# ---------- IFW ----------
+# IFW XML lives at /data/system/ifw/<pkg>.xml. We manage one file per package.
+# Format:
+#   <rules>
+#     <activity  block="true" log="false"><component-filter name="pkg/cls"/></activity>
+#     <service   block="true"><component-filter name="pkg/cls"/></service>
+#     <broadcast block="true"><component-filter name="pkg/cls"/></broadcast>
+#   </rules>
+
+ifw_path() { printf '%s/%s.xml\n' "$IFW_DIR" "$1"; }
+
+ifw_kind_for() {
+    # given pkg/cls, return activity|service|broadcast (default activity)
+    local pkg=$1 comp=$2 kind
+    kind=$(list_components "$pkg" all 2>/dev/null \
+        | awk -v c="$comp" '$1==c {print $2}' | tr -d '[]' | head -1)
+    case $kind in
+        activity|service) printf '%s\n' "$kind" ;;
+        receiver)         printf 'broadcast\n' ;;
+        *)                printf 'activity\n' ;;
+    esac
+}
+
+ifw_block() {
+    local pkg=$1 comp=$2 kind file tmp existing
+    [[ $comp == */* ]] || comp="$pkg/$comp"
+    kind=$(ifw_kind_for "$pkg" "$comp")
+    file=$(ifw_path "$pkg")
+    tmp=$(mktemp) || die "mktemp"
+
+    if s test -f "$file"; then
+        existing=$(s cat "$file")
+        if grep -qF "name=\"$comp\"" <<<"$existing"; then
+            warn "already blocked: $comp"; rm -f "$tmp"; return 0
+        fi
+        # insert before </rules>
+        awk -v line="    <$kind block=\"true\" log=\"false\"><component-filter name=\"$comp\"/></$kind>" '
+            /<\/rules>/ { print line }
+            { print }
+        ' <<<"$existing" >"$tmp"
+    else
+        cat >"$tmp" <<EOF
+<rules>
+    <$kind block="true" log="false"><component-filter name="$comp"/></$kind>
+</rules>
+EOF
+    fi
+    s mkdir -p "$IFW_DIR"
+    s cp "$tmp" "$file" && s chmod 600 "$file" && s chown system:system "$file" 2>/dev/null
+    rm -f "$tmp"
+    ok "ifw blocked $kind: $comp"
+}
+
+ifw_unblock() {
+    local pkg=$1 comp=$2 file tmp existing
+    [[ $comp == */* ]] || comp="$pkg/$comp"
+    file=$(ifw_path "$pkg")
+    s test -f "$file" || { warn "no ifw file for $pkg"; return 0; }
+    existing=$(s cat "$file")
+    grep -qF "name=\"$comp\"" <<<"$existing" || { warn "not blocked: $comp"; return 0; }
+    tmp=$(mktemp) || die "mktemp"
+    grep -vF "name=\"$comp\"" <<<"$existing" >"$tmp"
+    # if no <component-filter left, drop the file
+    if ! grep -q '<component-filter' "$tmp"; then
+        s rm -f "$file"
+        rm -f "$tmp"
+        ok "ifw cleared all rules for $pkg"
+        return 0
+    fi
+    s cp "$tmp" "$file"; rm -f "$tmp"
+    ok "ifw unblocked: $comp"
+}
+
+ifw_list() {
+    local pkg=${1-}
+    if [[ -n $pkg ]]; then
+        local file; file=$(ifw_path "$pkg")
+        s test -f "$file" || { warn "no ifw rules for $pkg"; return 0; }
+        s cat "$file"
+    else
+        s ls "$IFW_DIR" 2>/dev/null
+    fi
+}
+
+ifw_clear() {
+    local pkg=$1 file; file=$(ifw_path "$pkg")
+    s test -f "$file" || { warn "no ifw rules for $pkg"; return 0; }
+    s rm -f "$file" && ok "removed $file"
+}
+
+# ---------- arg dispatcher ----------
+usage() {
+    cat <<EOF
+${C_B}tam${C_R} — Termux App Manager (v$VERSION)
+
+${C_B}usage${C_R}
+  tam                              interactive menu
+  tam <command> [args...]
+
+${C_B}package selection${C_R}
+  Most commands take <pkg>. If <pkg> is a partial name, you'll be prompted
+  to pick. fzf is used when available; otherwise a numbered menu.
+
+${C_B}commands${C_R}
+  list [-3|-s|-d|-e|-all]          list packages (3rd-party / system / disabled / enabled / all)
+  search <partial>                 print matching package names
+  info <pkg>                       show metadata, version, paths, launcher
+  path <pkg>                       print apk path(s)
+
+  launch <pkg>                     start default launcher activity
+  open   <pkg>                     pick an activity and start it
+  start  <pkg/component>           start a specific component
+  settings <pkg>                   open OS app-info screen
+
+  components <pkg> [kind]          list components (kind: activity|service|receiver|provider|all)
+  activities <pkg>                 alias for: components <pkg> activity
+  services   <pkg>                 alias for: components <pkg> service
+  receivers  <pkg>                 alias for: components <pkg> receiver
+  providers  <pkg>                 alias for: components <pkg> provider
+
+  enable      <pkg>                pm enable
+  disable     <pkg>                pm disable-user --user 0
+  hide        <pkg>                pm hide
+  unhide      <pkg>                pm unhide
+  suspend     <pkg> [true|false]   pm suspend
+  enable-c    <pkg/comp>           enable a component
+  disable-c   <pkg/comp>           disable a component
+  force-stop  <pkg>                am force-stop
+  kill        <pkg>                am kill
+  clear       <pkg>                pm clear (wipes data)
+
+  uninstall   <pkg> [-k]           uninstall (-k keeps data/cache)
+  install     <apk>                pm install -r -g
+
+  extract     <pkg> [dir]          dump base + split APKs to dir (default: cwd)
+
+  perms       <pkg>                show permission state
+  grant       <pkg> <perm>         pm grant
+  revoke      <pkg> <perm>         pm revoke
+
+  ifw-block   <pkg> [comp]         add IFW rule (interactive picker if no comp)
+  ifw-unblock <pkg> [comp]         remove a single IFW rule
+  ifw-list    [pkg]                list rules (or all rule files if no pkg)
+  ifw-clear   <pkg>                delete all IFW rules for pkg
+
+  help                             this message
+  version                          print version
+
+${C_B}env${C_R}
+  NO_COLOR=1                       disable colored output
+EOF
+}
+
+# resolve_pkg <maybe-partial>  → echoes resolved package
+resolve_pkg() {
+    local arg=${1-}
+    pick_pkg "$arg"
+}
+
+cmd_list() {
+    local flag=${1:--all}
+    case $flag in
+        -3|-s|-d|-e) pm_list "$flag" ;;
+        -all|"")     pm_list ;;
+        *)           die "unknown filter: $flag" ;;
+    esac
+}
+
+dispatch() {
+    local cmd=${1-}; shift || true
+    case $cmd in
+        ""|help|-h|--help) usage ;;
+        version|-V|--version) printf 'tam %s\n' "$VERSION" ;;
+
+        list)        cmd_list "$@" ;;
+        search)      [[ $# -ge 1 ]] || die "need partial"; pm_list | grep -i -- "$1" ;;
+        info)        act_info "$(resolve_pkg "${1-}")" ;;
+        path)        act_path "$(resolve_pkg "${1-}")" ;;
+
+        launch)      act_launch     "$(resolve_pkg "${1-}")" ;;
+        open)        act_pick_activity "$(resolve_pkg "${1-}")" ;;
+        start)       [[ ${1-} == */* ]] || die "need pkg/component"; s am start -n "$1" ;;
+        settings)    act_settings   "$(resolve_pkg "${1-}")" ;;
+
+        components|comp)  act_components "$(resolve_pkg "${1-}")" "${2:-all}" ;;
+        activities|act)   act_components "$(resolve_pkg "${1-}")" activity ;;
+        services|svc)     act_components "$(resolve_pkg "${1-}")" service ;;
+        receivers|recv)   act_components "$(resolve_pkg "${1-}")" receiver ;;
+        providers|prov)   act_components "$(resolve_pkg "${1-}")" provider ;;
+
+        enable)      act_enable_pkg  "$(resolve_pkg "${1-}")" ;;
+        disable)     act_disable_pkg "$(resolve_pkg "${1-}")" ;;
+        hide)        act_hide        "$(resolve_pkg "${1-}")" ;;
+        unhide)      act_unhide      "$(resolve_pkg "${1-}")" ;;
+        suspend)     act_suspend     "$(resolve_pkg "${1-}")" "${2:-true}" ;;
+        enable-c)    [[ ${1-} == */* ]] || die "need pkg/component"; act_enable_component "$1" ;;
+        disable-c)   [[ ${1-} == */* ]] || die "need pkg/component"; act_disable_component "$1" ;;
+
+        force-stop|fs) act_force_stop "$(resolve_pkg "${1-}")" ;;
+        kill)        act_kill        "$(resolve_pkg "${1-}")" ;;
+        clear)       act_clear       "$(resolve_pkg "${1-}")" ;;
+
+        uninstall|rm)
+            local pkg keep=0
+            for a in "$@"; do
+                case $a in -k) keep=1 ;; *) pkg=$a ;; esac
+            done
+            act_uninstall "$(resolve_pkg "$pkg")" "$keep" ;;
+        install)     [[ -n ${1-} ]] || die "need apk"; act_install "$1" ;;
+
+        extract|pull)
+            local pkg=$1 dest=${2:-$EXTRACT_DEFAULT}
+            act_extract "$(resolve_pkg "$pkg")" "$dest" ;;
+
+        perms)       act_perms  "$(resolve_pkg "${1-}")" ;;
+        grant)       act_grant  "$(resolve_pkg "${1-}")" "${2-}" ;;
+        revoke)      act_revoke "$(resolve_pkg "${1-}")" "${2-}" ;;
+
+        ifw-block)
+            local pkg comp
+            pkg=$(resolve_pkg "${1-}")
+            if [[ -n ${2-} ]]; then
+                comp=$2
+            else
+                comp=$(list_components "$pkg" all | pick_one "component to block") || die "cancelled"
+                comp=${comp%% *}
+            fi
+            ifw_block "$pkg" "$comp" ;;
+        ifw-unblock)
+            local pkg=$(resolve_pkg "${1-}") comp
+            if [[ -n ${2-} ]]; then
+                comp=$2
+            else
+                comp=$(ifw_list "$pkg" | grep -oE 'name="[^"]+"' | sed 's/^name="//;s/"$//' \
+                       | pick_one "component to unblock") || die "cancelled"
+            fi
+            ifw_unblock "$pkg" "$comp" ;;
+        ifw-list)    ifw_list "${1-}" ;;
+        ifw-clear)   ifw_clear "$(resolve_pkg "${1-}")" ;;
+
+        *) err "unknown command: $cmd"; usage; return 2 ;;
+    esac
+}
+
+# ---------- interactive menu ----------
+menu_for_pkg() {
+    local pkg=$1 choice
+    while :; do
+        printf '\n%s%s%s\n' "$C_B$C_BLU" "$pkg" "$C_R" >&2
+        cat >&2 <<EOF
+  ${C_DIM}1${C_R}  info
+  ${C_DIM}2${C_R}  launch (default activity)
+  ${C_DIM}3${C_R}  open (pick activity)
+  ${C_DIM}4${C_R}  list components
+  ${C_DIM}5${C_R}  disable / enable package
+  ${C_DIM}6${C_R}  disable / enable component
+  ${C_DIM}7${C_R}  force-stop / clear data
+  ${C_DIM}8${C_R}  uninstall
+  ${C_DIM}9${C_R}  extract APK(s)
+  ${C_DIM}10${C_R} permissions
+  ${C_DIM}11${C_R} IFW: block component
+  ${C_DIM}12${C_R} IFW: unblock component
+  ${C_DIM}13${C_R} IFW: list rules
+  ${C_DIM}14${C_R} IFW: clear all rules
+  ${C_DIM}15${C_R} open OS settings
+  ${C_DIM}p${C_R}  pick another package
+  ${C_DIM}q${C_R}  quit
+EOF
+        read -rp "> " choice </dev/tty || return 0
+        case $choice in
+            1)  act_info "$pkg" ;;
+            2)  act_launch "$pkg" ;;
+            3)  act_pick_activity "$pkg" ;;
+            4)  local k; k=$(printf 'all\nactivity\nreceiver\nservice\nprovider\n' | pick_one "kind") || continue
+                list_components "$pkg" "$k" | ${PAGER:-less -RFX} ;;
+            5)  local s2; s2=$(printf 'disable\nenable\nhide\nunhide\nsuspend on\nsuspend off\n' | pick_one "state") || continue
+                case $s2 in
+                    disable)     act_disable_pkg "$pkg" ;;
+                    enable)      act_enable_pkg  "$pkg" ;;
+                    hide)        act_hide   "$pkg" ;;
+                    unhide)      act_unhide "$pkg" ;;
+                    "suspend on")  act_suspend "$pkg" true ;;
+                    "suspend off") act_suspend "$pkg" false ;;
+                esac ;;
+            6)  local action comp
+                action=$(printf 'disable\nenable\n' | pick_one "action") || continue
+                comp=$(list_components "$pkg" all | pick_one "component") || continue
+                comp=${comp%% *}
+                if [[ $action == disable ]]; then act_disable_component "$comp"
+                else act_enable_component "$comp"; fi ;;
+            7)  local a; a=$(printf 'force-stop\nkill\nclear\n' | pick_one "action") || continue
+                case $a in force-stop) act_force_stop "$pkg" ;;
+                           kill)       act_kill       "$pkg" ;;
+                           clear)      read -rp "really clear data for $pkg? [y/N] " yn </dev/tty
+                                       [[ $yn == y* ]] && act_clear "$pkg" ;;
+                esac ;;
+            8)  read -rp "really uninstall $pkg? [y/N] " yn </dev/tty
+                [[ $yn == y* ]] || continue
+                read -rp "keep data? [y/N] " kd </dev/tty
+                [[ $kd == y* ]] && act_uninstall "$pkg" 1 || act_uninstall "$pkg" 0
+                return 0 ;;
+            9)  read -rp "dest dir [$EXTRACT_DEFAULT]: " d </dev/tty
+                act_extract "$pkg" "${d:-$EXTRACT_DEFAULT}" ;;
+            10) act_perms "$pkg" | ${PAGER:-less -RFX} ;;
+            11) local comp
+                comp=$(list_components "$pkg" all | pick_one "block which") || continue
+                comp=${comp%% *}; ifw_block "$pkg" "$comp" ;;
+            12) local comp
+                comp=$(ifw_list "$pkg" | grep -oE 'name="[^"]+"' | sed 's/^name="//;s/"$//' \
+                       | pick_one "unblock which") || continue
+                ifw_unblock "$pkg" "$comp" ;;
+            13) ifw_list "$pkg" ;;
+            14) read -rp "really clear all IFW rules for $pkg? [y/N] " yn </dev/tty
+                [[ $yn == y* ]] && ifw_clear "$pkg" ;;
+            15) act_settings "$pkg" ;;
+            p|P) return 1 ;;
+            q|Q|"") return 0 ;;
+            *)  warn "unknown: $choice" ;;
+        esac
+    done
+}
+
+interactive() {
+    ensure_sudo
+    while :; do
+        local pkg
+        read -rp "package (partial ok, blank to list, q quit): " pkg </dev/tty || break
+        [[ $pkg == q || $pkg == Q ]] && break
+        pkg=$(pick_pkg "$pkg") || continue
+        menu_for_pkg "$pkg" || continue
+        # menu returned 0 → quit; 1 → loop back to picker
+        case $? in 0) break ;; esac
+    done
+    ok "bye"
+}
+
+# ---------- main ----------
+if [[ $# -eq 0 ]]; then
+    interactive
+else
+    dispatch "$@"
+fi
