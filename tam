@@ -144,12 +144,25 @@ list_components() {
     esac
 }
 
-# launcher activity for a package, or empty
+# launcher activity for a package (or empty). Tries cmd package (≥10), then dumpsys.
 main_activity() {
-    local pkg=$1
-    s cmd package query-activities -a android.intent.action.MAIN \
-        -c android.intent.category.LAUNCHER --components 2>/dev/null \
-        | awk -v p="$pkg/" 'index($0,p)==1' | head -1
+    local pkg=$1 hit
+    hit=$(s cmd package query-activities -a android.intent.action.MAIN \
+            -c android.intent.category.LAUNCHER --components 2>/dev/null \
+          | awk -v p="$pkg/" 'index($0,p)==1' | head -1)
+    if [[ -n $hit ]]; then printf '%s\n' "$hit"; return 0; fi
+    # fallback: parse the resolver table; emit each component with its filter
+    # actions/categories on one line, then grep for MAIN+LAUNCHER.
+    s pm dump "$pkg" 2>/dev/null | awk -v p="$pkg" '
+        /^Activity Resolver Table:/ { intab=1; next }
+        intab && /^[A-Z]/           { intab=0 }
+        intab && match($0, p"/[A-Za-z0-9_.$]+") {
+            if (cur) print cur " " buf
+            cur=substr($0, RSTART, RLENGTH); buf=""; next
+        }
+        intab && cur { buf = buf " " $0 }
+        END { if (cur) print cur " " buf }
+    ' | awk '/android\.intent\.action\.MAIN/ && /android\.intent\.category\.LAUNCHER/ {print $1; exit}'
 }
 
 # ---------- actions ----------
@@ -282,15 +295,417 @@ act_settings() {
         -d "package:$1"
 }
 
-act_perms() {
+# ---------- permissions ----------
+# Output: <state>\t<perm>\t<kind>
+#   state: granted | denied | requested
+#   kind:  runtime | install | requested
+_perm_table() {
     local pkg=$1
-    s dumpsys package "$pkg" 2>/dev/null \
-        | awk '/runtime permissions:/,/^[A-Za-z]/' \
-        | grep -E 'android\.permission\.|granted='
+    s dumpsys package "$pkg" 2>/dev/null | awk '
+        /^    User 0:/ { u0=1; next }
+        u0 && /^    User [0-9]+:/ { u0=0 }
+        u0 && /^      runtime permissions:/ { sect="runtime"; next }
+        u0 && sect=="runtime" && /^      [a-zA-Z]/ && !/permission/ { sect="" }
+        sect=="runtime" && u0 && /granted=/ {
+            perm=$1; sub(/:$/, "", perm)
+            state=($0 ~ /granted=true/) ? "granted" : "denied"
+            print state "\t" perm "\truntime"
+            next
+        }
+        /^    install permissions:/ { sect="install"; next }
+        sect=="install" && /^    [A-Za-z]/ { sect="" }
+        sect=="install" && /granted=/ && !/userId=/ {
+            perm=$1; sub(/:$/, "", perm)
+            state=($0 ~ /granted=true/) ? "granted" : "denied"
+            print state "\t" perm "\tinstall"
+            next
+        }
+        /^    requested permissions:/ { sect="requested"; next }
+        sect=="requested" && /^    [A-Za-z]/ { sect="" }
+        sect=="requested" && /^      [a-zA-Z]/ {
+            perm=$1
+            print "requested\t" perm "\trequested"
+        }
+    '
 }
 
-act_grant()  { s pm grant  "$1" "$2"; }
-act_revoke() { s pm revoke "$1" "$2"; }
+# pretty-print perms (granted first, then denied, then declared-only)
+act_perms() {
+    local pkg=$1 tbl declared
+    tbl=$(_perm_table "$pkg")
+    [[ -z $tbl ]] && { warn "no permissions found for $pkg"; return 1; }
+
+    # perms appearing in runtime/install
+    declared=$(awk -F'\t' '$3!="requested"{print $2}' <<<"$tbl" | sort -u)
+
+    printf '%s== runtime ==%s\n' "$C_B$C_CYN" "$C_R"
+    awk -F'\t' '$3=="runtime"{print}' <<<"$tbl" | sort | while IFS=$'\t' read -r st perm _; do
+        if [[ $st == granted ]]; then
+            printf '  %s[G]%s %s\n' "$C_GRN" "$C_R" "$perm"
+        else
+            printf '  %s[ ]%s %s\n' "$C_DIM" "$C_R" "$perm"
+        fi
+    done
+
+    printf '\n%s== install (auto) ==%s\n' "$C_B$C_CYN" "$C_R"
+    awk -F'\t' '$3=="install"{print}' <<<"$tbl" | sort | while IFS=$'\t' read -r st perm _; do
+        if [[ $st == granted ]]; then
+            printf '  %s[G]%s %s\n' "$C_GRN" "$C_R" "$perm"
+        else
+            printf '  %s[X]%s %s\n' "$C_RED" "$C_R" "$perm"
+        fi
+    done
+
+    # requested-but-unresolved (in manifest but not in runtime/install table)
+    local req_only
+    req_only=$(comm -23 \
+        <(awk -F'\t' '$3=="requested"{print $2}' <<<"$tbl" | sort -u) \
+        <(printf '%s\n' "$declared"))
+    if [[ -n $req_only ]]; then
+        printf '\n%s== declared only ==%s\n' "$C_B$C_CYN" "$C_R"
+        while IFS= read -r perm; do
+            [[ -z $perm ]] && continue
+            printf '  %s[?]%s %s\n' "$C_YEL" "$C_R" "$perm"
+        done <<<"$req_only"
+    fi
+}
+
+# pick a runtime perm; arg $2 filters: granted|denied|all (default all)
+_pick_runtime_perm() {
+    local pkg=$1 filter=${2:-all} tbl items
+    tbl=$(_perm_table "$pkg")
+    case $filter in
+        granted) items=$(awk -F'\t' '$3=="runtime" && $1=="granted"{printf "[G] %s\n",$2}' <<<"$tbl") ;;
+        denied)  items=$(awk -F'\t' '$3=="runtime" && $1=="denied" {printf "[ ] %s\n",$2}' <<<"$tbl") ;;
+        *)       items=$(awk -F'\t' '$3=="runtime"{
+                            tag=($1=="granted")?"[G]":"[ ]"; printf "%s %s\n",tag,$2 }' <<<"$tbl") ;;
+    esac
+    [[ -z $items ]] && { warn "no runtime perms ($filter) for $pkg"; return 1; }
+    pick_one "perm" <<<"$items" | awk '{print $NF}'
+}
+
+act_grant() {
+    local pkg=$1 perm=${2-}
+    if [[ -z $perm ]]; then
+        perm=$(_pick_runtime_perm "$pkg" denied) || return 1
+    fi
+    s pm grant "$pkg" "$perm" && ok "granted $perm"
+}
+act_revoke() {
+    local pkg=$1 perm=${2-}
+    if [[ -z $perm ]]; then
+        perm=$(_pick_runtime_perm "$pkg" granted) || return 1
+    fi
+    s pm revoke "$pkg" "$perm" && ok "revoked $perm"
+}
+
+# interactive permission manager: pick, toggle, repeat
+act_perm_manage() {
+    local pkg=$1 sel state perm
+    while :; do
+        sel=$(_perm_table "$pkg" | awk -F'\t' '$3=="runtime"{
+            tag=($1=="granted")?"[G]":"[ ]"; printf "%s %s\n",tag,$2 }' \
+            | sort | pick_one "perm to toggle (esc/q to quit)") || return 0
+        state=${sel%% *}; perm=${sel##* }
+        if [[ $state == "[G]" ]]; then
+            s pm revoke "$pkg" "$perm" && ok "revoked $perm" \
+                || err "revoke failed (perm may be policy-locked)"
+        else
+            s pm grant "$pkg" "$perm" && ok "granted $perm" \
+                || err "grant failed (perm may not be runtime-grantable)"
+        fi
+    done
+}
+
+# ---------- accessibility ----------
+# Enabled accessibility services live in: secure enabled_accessibility_services
+# Format: colon-separated list of pkg/service. Master switch: accessibility_enabled (0/1).
+A11Y_KEY=enabled_accessibility_services
+
+a11y_get_enabled() {
+    local v; v=$(s settings get secure $A11Y_KEY 2>/dev/null)
+    [[ $v == null || -z $v ]] && return 0
+    tr ':' '\n' <<<"$v" | sed '/^$/d'
+}
+
+a11y_set_enabled() {
+    local list=$1
+    s settings put secure $A11Y_KEY "$list"
+    if [[ -z $list ]]; then
+        s settings put secure accessibility_enabled 0
+    else
+        s settings put secure accessibility_enabled 1
+    fi
+}
+
+# all accessibility services on the device (pkg/comp)
+a11y_all_services() {
+    s cmd package query-services -a android.accessibilityservice.AccessibilityService \
+        --components 2>/dev/null | sort -u
+}
+
+# services declared by a single package
+a11y_pkg_services() {
+    local pkg=$1
+    a11y_all_services | awk -v p="$pkg/" 'index($0,p)==1'
+}
+
+a11y_enable() {
+    local comp=$1 cur new
+    cur=$(a11y_get_enabled)
+    if grep -qx "$comp" <<<"$cur"; then warn "already enabled: $comp"; return 0; fi
+    if [[ -z $cur ]]; then new=$comp
+    else new=$(printf '%s\n%s' "$cur" "$comp" | paste -sd: -); fi
+    a11y_set_enabled "$new" && ok "a11y enabled: $comp"
+}
+
+a11y_disable() {
+    local comp=$1 cur new
+    cur=$(a11y_get_enabled)
+    grep -qx "$comp" <<<"$cur" || { warn "not enabled: $comp"; return 0; }
+    new=$(grep -vx "$comp" <<<"$cur" | paste -sd: -)
+    a11y_set_enabled "$new" && ok "a11y disabled: $comp"
+}
+
+a11y_list() {
+    local cur all
+    cur=$(a11y_get_enabled)
+    all=$(a11y_all_services)
+    printf '%s== enabled ==%s\n' "$C_B$C_GRN" "$C_R"
+    [[ -n $cur ]] && sed 's/^/  /' <<<"$cur" || printf '  %s(none)%s\n' "$C_DIM" "$C_R"
+    printf '\n%s== available (disabled) ==%s\n' "$C_B$C_CYN" "$C_R"
+    if [[ -n $cur ]]; then
+        comm -23 <(sort <<<"$all") <(sort <<<"$cur") | sed 's/^/  /'
+    else
+        sed 's/^/  /' <<<"$all"
+    fi
+}
+
+act_a11y() {
+    local sub=${1-} arg=${2-}
+    case $sub in
+        ""|list)  a11y_list ;;
+        on)       s settings put secure accessibility_enabled 1 && ok "a11y master: on" ;;
+        off)      s settings put secure accessibility_enabled 0 && ok "a11y master: off" ;;
+        enable)   [[ $arg == */* ]] || arg=$(a11y_all_services | pick_one "service") || return 1
+                  a11y_enable  "$arg" ;;
+        disable)  if [[ -z $arg ]]; then
+                      arg=$(a11y_get_enabled | pick_one "service to disable") || return 1
+                  fi
+                  a11y_disable "$arg" ;;
+        toggle)   # interactive: pick any service, flip its state
+                  local cur all merged comp state
+                  cur=$(a11y_get_enabled); all=$(a11y_all_services)
+                  merged=$(awk -v c="$cur" '
+                      BEGIN { n=split(c,e,"\n"); for (i=1;i<=n;i++) en[e[i]]=1 }
+                      { tag = (($0 in en)?"[E]":"[ ]"); print tag" "$0 }
+                  ' <<<"$all")
+                  comp=$(pick_one "toggle" <<<"$merged") || return 0
+                  state=${comp%% *}; comp=${comp##* }
+                  if [[ $state == "[E]" ]]; then a11y_disable "$comp"
+                  else a11y_enable "$comp"; fi ;;
+        *)        # treat as a package name → list/pick services for that pkg
+                  local pkg svcs
+                  pkg=$(resolve_pkg "$sub")
+                  svcs=$(a11y_pkg_services "$pkg")
+                  [[ -z $svcs ]] && { warn "$pkg declares no accessibility services"; return 0; }
+                  local cur merged
+                  cur=$(a11y_get_enabled)
+                  merged=$(awk -v c="$cur" '
+                      BEGIN { n=split(c,e,"\n"); for (i=1;i<=n;i++) en[e[i]]=1 }
+                      { tag = (($0 in en)?"[E]":"[ ]"); print tag" "$0 }
+                  ' <<<"$svcs")
+                  local sel state comp
+                  sel=$(pick_one "service" <<<"$merged") || return 0
+                  state=${sel%% *}; comp=${sel##* }
+                  if [[ $state == "[E]" ]]; then a11y_disable "$comp"
+                  else a11y_enable "$comp"; fi ;;
+    esac
+}
+
+# ---------- AppOps ----------
+# Some perms (SYSTEM_ALERT_WINDOW, MANAGE_EXTERNAL_STORAGE, PACKAGE_USAGE_STATS,
+# WRITE_SETTINGS, REQUEST_INSTALL_PACKAGES, etc.) aren't grantable via pm grant.
+# They're toggled through Android's app-op layer instead.
+
+# Android 9+ has `cmd appops`; older has the bare `appops` binary. Probe once.
+_APPOPS_BIN=
+_appops() {
+    if [[ -z $_APPOPS_BIN ]]; then
+        if s cmd appops help >/dev/null 2>&1; then _APPOPS_BIN="cmd appops"
+        else                                       _APPOPS_BIN="appops"; fi
+    fi
+    s $_APPOPS_BIN "$@"
+}
+
+# parse appops get output → "<state>\t<op>"
+_appops_table() {
+    _appops get "$1" 2>/dev/null | awk '
+        # skip "Uid mode:" prefix that appears on first line
+        { sub(/^Uid mode:[[:space:]]*/, "") }
+        /^[A-Z_]+: / {
+            split($0, a, ":")
+            op=a[1]
+            rest=a[2]; sub(/^[[:space:]]+/, "", rest)
+            # drop "; time=...; duration=..."
+            sub(/;.*/, "", rest)
+            sub(/[[:space:]]+$/, "", rest)
+            print rest "\t" op
+        }
+    '
+}
+
+act_appops() {
+    local pkg=$1 op=${2-} mode=${3-}
+    if [[ -z $op ]]; then
+        # pretty list
+        local tbl; tbl=$(_appops_table "$pkg")
+        [[ -z $tbl ]] && { warn "no app-ops state for $pkg"; return 1; }
+        printf '%s== app-ops ==%s\n' "$C_B$C_CYN" "$C_R"
+        sort -k2 <<<"$tbl" | while IFS=$'\t' read -r st o; do
+            local c=$C_DIM
+            case $st in
+                allow)   c=$C_GRN ;;
+                ignore)  c=$C_YEL ;;
+                deny)    c=$C_RED ;;
+                default) c=$C_DIM ;;
+            esac
+            printf '  %s%-7s%s %s\n' "$c" "$st" "$C_R" "$o"
+        done
+        return 0
+    fi
+    if [[ -z $mode ]]; then
+        # interactive: pick mode
+        mode=$(printf 'allow\nignore\ndeny\ndefault\n' | pick_one "mode for $op") || return 1
+    fi
+    _appops set "$pkg" "$op" "$mode" && ok "$op → $mode"
+}
+
+# interactive: pick an op, then a mode
+act_appops_pick() {
+    local pkg=$1 sel op mode
+    sel=$(_appops_table "$pkg" | awk -F'\t' '{printf "%-7s %s\n",$1,$2}' \
+            | sort -k2 | pick_one "op (esc to quit)") || return 0
+    op=$(awk '{print $NF}' <<<"$sel")
+    mode=$(printf 'allow\nignore\ndeny\ndefault\n' | pick_one "mode for $op") || return 1
+    _appops set "$pkg" "$op" "$mode" && ok "$op → $mode"
+}
+
+# ---------- battery optimization (deviceidle whitelist) ----------
+# Three categories: system, system-excidle, user. Only the user list is
+# toggleable. A package is "exempt from battery optimization" if it appears
+# in any list (Android settings UI mirrors this).
+
+batt_list_user() {
+    s dumpsys deviceidle whitelist 2>/dev/null \
+        | awk -F, '$1=="user"{print $2}' | sort -u
+}
+
+batt_list_all() {
+    s dumpsys deviceidle whitelist 2>/dev/null \
+        | awk -F, 'NF>=2 && $1!=""{printf "%s\t%s\n",$1,$2}' | sort -u -k2
+}
+
+batt_status() {
+    local pkg=$1 hits
+    hits=$(s dumpsys deviceidle whitelist 2>/dev/null | awk -F, -v p="$pkg" '$2==p{print $1}')
+    if [[ -z $hits ]]; then
+        printf '%s%s%s is %snot whitelisted%s\n' "$C_B" "$pkg" "$C_R" "$C_RED" "$C_R"
+    else
+        printf '%s%s%s is whitelisted: %s\n' "$C_B" "$pkg" "$C_R" "$(tr '\n' ',' <<<"$hits" | sed 's/,$//')"
+    fi
+}
+
+batt_add()    { s cmd deviceidle whitelist "+$1" >/dev/null && ok "battery-exempt: $1"; }
+batt_remove() { s cmd deviceidle whitelist "-$1" >/dev/null && ok "battery-optimised: $1"; }
+
+act_batt() {
+    local sub=${1-} arg=${2-}
+    case $sub in
+        ""|list)
+            printf '%s== user-whitelist (battery-exempt) ==%s\n' "$C_B$C_CYN" "$C_R"
+            local u; u=$(batt_list_user)
+            [[ -n $u ]] && sed 's/^/  /' <<<"$u" || printf '  %s(none)%s\n' "$C_DIM" "$C_R"
+            ;;
+        all)
+            batt_list_all | awk -F'\t' '{printf "  %-16s %s\n",$1,$2}'
+            ;;
+        status)
+            [[ -n $arg ]] || die "need pkg"
+            batt_status "$(resolve_pkg "$arg")"
+            ;;
+        add|exempt)
+            [[ -n $arg ]] || die "need pkg"
+            batt_add "$(resolve_pkg "$arg")"
+            ;;
+        remove|rm|optimise|optimize)
+            local pkg
+            if [[ -z $arg ]]; then
+                pkg=$(batt_list_user | pick_one "remove from whitelist") || return 1
+            else
+                pkg=$(resolve_pkg "$arg")
+            fi
+            batt_remove "$pkg"
+            ;;
+        toggle)
+            local pkg=$(resolve_pkg "$arg")
+            if s dumpsys deviceidle whitelist 2>/dev/null | awk -F, '$1=="user"{print $2}' | grep -qx "$pkg"; then
+                batt_remove "$pkg"
+            else
+                batt_add "$pkg"
+            fi ;;
+        *) die "unknown batt sub: $sub (try: list|all|status|add|remove|toggle)" ;;
+    esac
+}
+
+# ---------- size breakdown ----------
+# Slow on big apps because data dirs walk the whole tree. Kept out of `info`.
+# Sources: APK(s), code cache (/data/app/...), internal data (/data/data/<pkg>),
+# external app data (/storage/emulated/0/Android/data/<pkg>), OBB.
+
+_fmt_bytes() { numfmt --to=iec --suffix=B "${1:-0}"; }
+
+_dir_bytes() {
+    # echo total bytes for a path that may not exist
+    local p=$1 b
+    s test -e "$p" || { printf 0; return; }
+    b=$(s du -sb "$p" 2>/dev/null | awk '{print $1; exit}')
+    printf '%s' "${b:-0}"
+}
+
+act_size() {
+    local pkg=$1 paths apk_total apk_dir code_b data_b ext_b obb_b total
+    paths=$(s pm path "$pkg" 2>/dev/null | sed 's/^package://')
+    [[ -z $paths ]] && die "not installed: $pkg"
+
+    # APK files (base + splits)
+    apk_total=0
+    while IFS= read -r p; do
+        [[ -z $p ]] && continue
+        local b; b=$(s stat -c%s "$p" 2>/dev/null || echo 0)
+        apk_total=$((apk_total + b))
+    done <<<"$paths"
+
+    # whole code dir (lib/, oat/, etc.) — parent of base.apk
+    apk_dir=$(dirname "$(head -1 <<<"$paths")")
+    code_b=$(_dir_bytes "$apk_dir")
+
+    info "scanning data dirs (slow on large apps)…"
+    data_b=$(_dir_bytes "/data/data/$pkg")
+    ext_b=$(_dir_bytes "/storage/emulated/0/Android/data/$pkg")
+    obb_b=$(_dir_bytes "/storage/emulated/0/Android/obb/$pkg")
+    # apk bytes are already inside code_b, don't double-count
+    total=$((code_b + data_b + ext_b + obb_b))
+
+    printf '%spackage%s     %s\n' "$C_B" "$C_R" "$pkg"
+    printf '  %sapk(s)%s    %s\n' "$C_B" "$C_R" "$(_fmt_bytes $apk_total)"
+    printf '  %scode dir%s  %s   %s(includes lib/, oat/, splits)%s\n' "$C_B" "$C_R" "$(_fmt_bytes $code_b)" "$C_DIM" "$C_R"
+    printf '  %sdata%s      %s   %s(/data/data/%s)%s\n' "$C_B" "$C_R" "$(_fmt_bytes $data_b)" "$C_DIM" "$pkg" "$C_R"
+    printf '  %sext data%s  %s   %s(Android/data/%s)%s\n' "$C_B" "$C_R" "$(_fmt_bytes $ext_b)" "$C_DIM" "$pkg" "$C_R"
+    printf '  %sobb%s       %s   %s(Android/obb/%s)%s\n' "$C_B" "$C_R" "$(_fmt_bytes $obb_b)" "$C_DIM" "$pkg" "$C_R"
+    printf '  %s%s──────%s\n' "$C_B" "$C_DIM" "$C_R"
+    printf '  %stotal%s     %s\n' "$C_B$C_GRN" "$C_R" "$(_fmt_bytes $total)"
+}
 
 # ---------- IFW ----------
 # IFW XML lives at /data/system/ifw/<pkg>.xml. We manage one file per package.
@@ -428,9 +843,30 @@ ${C_B}commands${C_R}
 
   extract     <pkg> [dir]          dump base + split APKs to dir (default: cwd)
 
-  perms       <pkg>                show permission state
-  grant       <pkg> <perm>         pm grant
-  revoke      <pkg> <perm>         pm revoke
+  perms       <pkg>                pretty list of all perms (runtime/install/declared)
+  perm        <pkg>                interactive picker — toggle runtime perms
+  grant       <pkg> [perm]         grant a perm (picker over denied if omitted)
+  revoke      <pkg> [perm]         revoke a perm (picker over granted if omitted)
+
+  a11y                             list enabled / available accessibility services
+  a11y on|off                      master accessibility switch
+  a11y enable  [pkg/comp]          enable a service (picker if omitted)
+  a11y disable [pkg/comp]          disable a service (picker over enabled if omitted)
+  a11y toggle                      pick any service and flip its state
+  a11y <pkg>                       pick & toggle services declared by <pkg>
+
+  appops <pkg>                     list app-op states (allow/ignore/deny/default)
+  appops <pkg> pick                interactive: pick op → pick mode
+  appops <pkg> <op> [mode]         set one op (mode picker if omitted)
+
+  batt                             list user-whitelisted (battery-exempt) packages
+  batt all                         dump full whitelist (system + user)
+  batt status <pkg>                show which list(s) <pkg> is in
+  batt add <pkg>                   exempt <pkg> from battery optimisation
+  batt remove [pkg]                un-exempt (picker over user list if omitted)
+  batt toggle <pkg>                flip exemption
+
+  size <pkg>                       APK / data / external / OBB byte breakdown (slow)
 
   ifw-block   <pkg> [comp]         add IFW rule (interactive picker if no comp)
   ifw-unblock <pkg> [comp]         remove a single IFW rule
@@ -506,9 +942,24 @@ dispatch() {
             local pkg=$1 dest=${2:-$EXTRACT_DEFAULT}
             act_extract "$(resolve_pkg "$pkg")" "$dest" ;;
 
-        perms)       act_perms  "$(resolve_pkg "${1-}")" ;;
-        grant)       act_grant  "$(resolve_pkg "${1-}")" "${2-}" ;;
-        revoke)      act_revoke "$(resolve_pkg "${1-}")" "${2-}" ;;
+        perms)       act_perms        "$(resolve_pkg "${1-}")" ;;
+        perm)        act_perm_manage  "$(resolve_pkg "${1-}")" ;;
+        grant)       act_grant        "$(resolve_pkg "${1-}")" "${2-}" ;;
+        revoke)      act_revoke       "$(resolve_pkg "${1-}")" "${2-}" ;;
+        a11y)        act_a11y "$@" ;;
+
+        appops)
+            local pkg=$(resolve_pkg "${1-}")
+            if [[ -z ${2-} ]]; then
+                act_appops "$pkg"
+            elif [[ ${2-} == pick ]]; then
+                act_appops_pick "$pkg"
+            else
+                act_appops "$pkg" "$2" "${3-}"
+            fi ;;
+
+        batt|battery) act_batt "$@" ;;
+        size|du)      act_size "$(resolve_pkg "${1-}")" ;;
 
         ifw-block)
             local pkg comp
@@ -551,12 +1002,14 @@ menu_for_pkg() {
   ${C_DIM}7${C_R}  force-stop / clear data
   ${C_DIM}8${C_R}  uninstall
   ${C_DIM}9${C_R}  extract APK(s)
-  ${C_DIM}10${C_R} permissions
-  ${C_DIM}11${C_R} IFW: block component
-  ${C_DIM}12${C_R} IFW: unblock component
-  ${C_DIM}13${C_R} IFW: list rules
-  ${C_DIM}14${C_R} IFW: clear all rules
-  ${C_DIM}15${C_R} open OS settings
+  ${C_DIM}10${C_R} permissions (perms / a11y / app-ops)
+  ${C_DIM}11${C_R} battery optimisation
+  ${C_DIM}12${C_R} size breakdown
+  ${C_DIM}13${C_R} IFW: block component
+  ${C_DIM}14${C_R} IFW: unblock component
+  ${C_DIM}15${C_R} IFW: list rules
+  ${C_DIM}16${C_R} IFW: clear all rules
+  ${C_DIM}17${C_R} open OS settings
   ${C_DIM}p${C_R}  pick another package
   ${C_DIM}q${C_R}  quit
 EOF
@@ -595,18 +1048,33 @@ EOF
                 return 0 ;;
             9)  read -rp "dest dir [$EXTRACT_DEFAULT]: " d </dev/tty
                 act_extract "$pkg" "${d:-$EXTRACT_DEFAULT}" ;;
-            10) act_perms "$pkg" | ${PAGER:-less -RFX} ;;
-            11) local comp
+            10) local pa
+                pa=$(printf 'view perms\nmanage runtime perms\naccessibility services\napp-ops (view)\napp-ops (toggle)\n' \
+                     | pick_one "perms") || continue
+                case $pa in
+                    "view perms")             act_perms "$pkg" | ${PAGER:-less -RFX} ;;
+                    "manage runtime perms")   act_perm_manage "$pkg" ;;
+                    "accessibility services") act_a11y "$pkg" ;;
+                    "app-ops (view)")         act_appops "$pkg" | ${PAGER:-less -RFX} ;;
+                    "app-ops (toggle)")       act_appops_pick "$pkg" ;;
+                esac ;;
+            11) local b
+                b=$(printf 'status\ntoggle\n' | pick_one "battery") || continue
+                case $b in status) batt_status "$pkg" ;;
+                           toggle) act_batt toggle "$pkg" ;;
+                esac ;;
+            12) act_size "$pkg" ;;
+            13) local comp
                 comp=$(list_components "$pkg" all | pick_one "block which") || continue
                 comp=${comp%% *}; ifw_block "$pkg" "$comp" ;;
-            12) local comp
+            14) local comp
                 comp=$(ifw_list "$pkg" | grep -oE 'name="[^"]+"' | sed 's/^name="//;s/"$//' \
                        | pick_one "unblock which") || continue
                 ifw_unblock "$pkg" "$comp" ;;
-            13) ifw_list "$pkg" ;;
-            14) read -rp "really clear all IFW rules for $pkg? [y/N] " yn </dev/tty
+            15) ifw_list "$pkg" ;;
+            16) read -rp "really clear all IFW rules for $pkg? [y/N] " yn </dev/tty
                 [[ $yn == y* ]] && ifw_clear "$pkg" ;;
-            15) act_settings "$pkg" ;;
+            17) act_settings "$pkg" ;;
             p|P) return 1 ;;
             q|Q|"") return 0 ;;
             *)  warn "unknown: $choice" ;;
