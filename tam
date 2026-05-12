@@ -260,18 +260,90 @@ act_kill()       { s am kill "$1"; }
 act_clear()      { s pm clear "$1"; }
 
 act_uninstall() {
-    local pkg=$1 keep=${2:-0}
-    if (( keep )); then
-        s pm uninstall -k --user 0 "$pkg"
-    else
-        s pm uninstall --user 0 "$pkg"
-    fi
+    local pkg=$1 keep=${2:-0} user_only=${3:-0}
+    local flags=()
+    (( keep )) && flags+=(-k)
+    (( user_only )) && flags+=(--user 0)
+    s pm uninstall "${flags[@]}" "$pkg"
 }
 
 act_install() {
-    local apk=$1
-    [[ -f $apk ]] || die "no such apk: $apk"
-    s pm install -r -g "$apk"
+    local target=$1
+    if [[ -d $target ]]; then
+        _install_split_dir "$target"
+    elif [[ -f $target ]]; then
+        local ext=${target##*.}
+        if [[ $ext == apk ]]; then
+            s pm install -r -g "$target"
+        elif [[ $ext == apks || $ext == zip || $ext == xapk ]]; then
+            _install_split_archive "$target"
+        else
+            die "unsupported file type: $ext (expected apk, apks, xapk, zip, or a directory of APKs)"
+        fi
+    else
+        die "no such file or directory: $target"
+    fi
+}
+
+_install_split_dir() {
+    local dir=$1
+    local -a apks=()
+    while IFS= read -r -d '' f; do
+        apks+=("$f")
+    done < <(find "$dir" -maxdepth 1 -name '*.apk' -print0 | sort -z)
+    (( ${#apks[@]} )) || die "no .apk files in $dir"
+    if (( ${#apks[@]} == 1 )); then
+        info "single APK: ${apks[0]}"
+        s pm install -r -g "${apks[0]}"
+        return
+    fi
+    info "installing ${#apks[@]} split APKs from $dir"
+    _install_session "${apks[@]}"
+}
+
+_install_split_archive() {
+    local archive=$1 tmpdir
+    tmpdir=$(mktemp -d) || die "mktemp -d"
+    trap 'rm -rf "$tmpdir"' RETURN
+    info "extracting $archive → $tmpdir"
+    unzip -q -o "$archive" -d "$tmpdir" '*.apk' 2>/dev/null \
+        || die "failed to extract APKs from $archive"
+    local -a apks=()
+    while IFS= read -r -d '' f; do
+        apks+=("$f")
+    done < <(find "$tmpdir" -name '*.apk' -print0 | sort -z)
+    (( ${#apks[@]} )) || die "no .apk files found in $archive"
+    info "installing ${#apks[@]} split APKs"
+    _install_session "${apks[@]}"
+}
+
+_install_session() {
+    local -a apks=("$@")
+    local total=0 size
+    for f in "${apks[@]}"; do
+        size=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null) || die "cannot stat $f"
+        total=$((total + size))
+    done
+    local session
+    session=$(s pm install-create -r -g -S "$total" 2>&1) || die "install-create failed: $session"
+    session=$(grep -oE '[0-9]+' <<<"$session" | head -1)
+    [[ -n $session ]] || die "could not parse session id"
+    local i=0
+    for f in "${apks[@]}"; do
+        size=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null)
+        info "  [$((i+1))/${#apks[@]}] $(basename "$f") ($(_fmt_bytes "$size"))"
+        s pm install-write -S "$size" "$session" "$i" "$f" \
+            || { s pm install-abandon "$session" 2>/dev/null; die "install-write failed for $(basename "$f")"; }
+        ((i++))
+    done
+    local result
+    result=$(s pm install-commit "$session" 2>&1)
+    if [[ $result == *Success* ]]; then
+        ok "installed (${#apks[@]} splits)"
+    else
+        err "install-commit failed: $result"
+        return 1
+    fi
 }
 
 act_path() { s pm path "$1"; }
@@ -838,8 +910,8 @@ ${C_B}commands${C_R}
   kill        <pkg>                am kill
   clear       <pkg>                pm clear (wipes data)
 
-  uninstall   <pkg> [-k]           uninstall (-k keeps data/cache)
-  install     <apk>                pm install -r -g
+  uninstall   <pkg> [-k] [--user]   uninstall (-k keeps data, --user = user 0 only)
+  install     <apk|dir|apks|xapk>  install APK, split dir, or bundle archive
 
   extract     <pkg> [dir]          dump base + split APKs to dir (default: cwd)
 
@@ -931,12 +1003,12 @@ dispatch() {
         clear)       act_clear       "$(resolve_pkg "${1-}")" ;;
 
         uninstall|rm)
-            local pkg keep=0
+            local pkg keep=0 user_only=0
             for a in "$@"; do
-                case $a in -k) keep=1 ;; *) pkg=$a ;; esac
+                case $a in -k) keep=1 ;; --user) user_only=1 ;; *) pkg=$a ;; esac
             done
-            act_uninstall "$(resolve_pkg "$pkg")" "$keep" ;;
-        install)     [[ -n ${1-} ]] || die "need apk"; act_install "$1" ;;
+            act_uninstall "$(resolve_pkg "$pkg")" "$keep" "$user_only" ;;
+        install)     [[ -n ${1-} ]] || die "need apk/dir"; act_install "$1" ;;
 
         extract|pull)
             local pkg=$1 dest=${2:-$EXTRACT_DEFAULT}
