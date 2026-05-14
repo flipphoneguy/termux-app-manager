@@ -35,6 +35,9 @@ ensure_sudo() {
 }
 s() { ensure_sudo; sudo "$@"; }
 
+# dumpsys package is ~6x faster than pm dump; fall back for non-standard ROMs
+_pkg_dump() { s dumpsys package "$1" 2>/dev/null || s pm dump "$1" 2>/dev/null; }
+
 # ---------- package picker ----------
 # pm_list [filter-flag]
 #   default: all packages
@@ -46,14 +49,14 @@ pm_list() {
 # pick_pkg <partial-or-empty>  → echoes the chosen package name
 pick_pkg() {
     local query=${1-} all matches
+    # fast path: exact package name skips listing all packages
+    if [[ -n $query && $query == *.* ]] && s pm path "$query" >/dev/null 2>&1; then
+        printf '%s\n' "$query"; return 0
+    fi
     all=$(pm_list)
     [[ -z $all ]] && die "no packages returned by pm"
 
     if [[ -n $query ]]; then
-        # exact match wins immediately
-        if grep -qx "$query" <<<"$all"; then
-            printf '%s\n' "$query"; return 0
-        fi
         matches=$(grep -i -- "$query" <<<"$all")
     else
         matches=$all
@@ -114,7 +117,7 @@ pick_one() {
 # list_components <pkg> <kind:activity|receiver|service|provider|all>
 list_components() {
     local pkg=$1 kind=${2:-all} dump
-    dump=$(s pm dump "$pkg" 2>/dev/null) || return 1
+    dump=$(_pkg_dump "$pkg") || return 1
 
     _section() {
         # _section <start-regex> <end-regex>
@@ -125,7 +128,7 @@ list_components() {
         ' <<<"$dump"
     }
     _grep_comps() {
-        grep -oE "$pkg/[A-Za-z0-9_.\$]+" | awk '{print $1}' | sort -u
+        grep -oE "$pkg/[A-Za-z0-9_.\$]+" | grep -v '/u[0-9]' | awk '{print $1}' | sort -u || true
     }
 
     case $kind in
@@ -144,16 +147,18 @@ list_components() {
     esac
 }
 
-# launcher activity for a package (or empty). Tries cmd package (≥10), then dumpsys.
+# launcher activity for a package (or empty).
+# Accepts optional $2 = pre-fetched dump (skips the slow cmd query).
 main_activity() {
-    local pkg=$1 hit
-    hit=$(s cmd package query-activities -a android.intent.action.MAIN \
-            -c android.intent.category.LAUNCHER --components 2>/dev/null \
-          | awk -v p="$pkg/" 'index($0,p)==1' | head -1)
-    if [[ -n $hit ]]; then printf '%s\n' "$hit"; return 0; fi
-    # fallback: parse the resolver table; emit each component with its filter
-    # actions/categories on one line, then grep for MAIN+LAUNCHER.
-    s pm dump "$pkg" 2>/dev/null | awk -v p="$pkg" '
+    local pkg=$1 dump=${2-} hit
+    if [[ -z $dump ]]; then
+        hit=$(s cmd package query-activities -a android.intent.action.MAIN \
+                -c android.intent.category.LAUNCHER --components 2>/dev/null \
+              | awk -v p="$pkg/" 'index($0,p)==1' | head -1)
+        if [[ -n $hit ]]; then printf '%s\n' "$hit"; return 0; fi
+        dump=$(_pkg_dump "$pkg")
+    fi
+    awk -v p="$pkg" '
         /^Activity Resolver Table:/ { intab=1; next }
         intab && /^[A-Z]/           { intab=0 }
         intab && match($0, p"/[A-Za-z0-9_.$]+") {
@@ -162,26 +167,30 @@ main_activity() {
         }
         intab && cur { buf = buf " " $0 }
         END { if (cur) print cur " " buf }
-    ' | awk '/android\.intent\.action\.MAIN/ && /android\.intent\.category\.LAUNCHER/ {print $1; exit}'
+    ' <<<"$dump" | awk '/android\.intent\.action\.MAIN/ && /android\.intent\.category\.LAUNCHER/ {print $1; exit}'
 }
 
 # ---------- actions ----------
 act_info() {
-    local pkg=$1 dump path ver enabled uid target installer
-    path=$(s pm path "$pkg" 2>/dev/null | sed 's/^package://')
-    [[ -z $path ]] && die "not installed: $pkg"
-    dump=$(s pm dump "$pkg" 2>/dev/null)
+    local pkg=$1 dump
+    dump=$(_pkg_dump "$pkg")
+    [[ -z $dump ]] && die "not installed: $pkg"
 
-    # extract first match of key=value (no whitespace in value)
-    _f() { grep -oE "(^|[ ])$1=[^ ]+" <<<"$dump" | head -1 | sed -E "s/.*$1=//"; }
-    ver=$(_f versionName)
-    target=$(_f targetSdk)
-    uid=$(_f appId)
-    installer=$(_f installerPackageName)
-    # User 0 enabled value (0=default,1=enabled,2=disabled,3=disabled-user,4=disabled-until-used)
-    enabled=$(awk '/^[[:space:]]+User 0:/ {
-        for (i=1;i<=NF;i++) if ($i ~ /^enabled=/) { sub(/enabled=/,"",$i); print $i; exit }
-    }' <<<"$dump")
+    # single awk pass for all fields (avoids ~15 subprocess spawns)
+    local fields path ver enabled uid target installer
+    fields=$(awk '
+        match($0, /codePath=[^ ]+/)        && !p  { p=substr($0, RSTART+9, RLENGTH-9) }
+        match($0, /versionName=[^ ]+/)     && !v  { v=substr($0, RSTART+12, RLENGTH-12) }
+        match($0, /targetSdk=[^ ]+/)       && !t  { t=substr($0, RSTART+10, RLENGTH-10) }
+        match($0, /appId=[^ ]+/)           && !u  { u=substr($0, RSTART+6, RLENGTH-6) }
+        match($0, /installerPackageName=[^ ]+/) && !i { i=substr($0, RSTART+21, RLENGTH-21) }
+        /^[[:space:]]+User 0:/ && !e {
+            for (j=1;j<=NF;j++) if ($j ~ /^enabled=/) { sub(/enabled=/,"",$j); e=$j; break }
+        }
+        END { printf "%s\t%s\t%s\t%s\t%s\t%s\n", p, v, t, u, i, e }
+    ' <<<"$dump")
+    IFS=$'\t' read -r path ver target uid installer enabled <<<"$fields"
+
     case $enabled in
         0) enabled="0 (default)" ;;
         1) enabled="1 (enabled)" ;;
@@ -196,8 +205,8 @@ act_info() {
     printf '%sappId%s      %s\n' "$C_B" "$C_R" "${uid:-?}"
     printf '%stargetSdk%s  %s\n' "$C_B" "$C_R" "${target:-?}"
     [[ -n $installer && $installer != null ]] && printf '%sinstaller%s  %s\n' "$C_B" "$C_R" "$installer"
-    printf '%spath%s       %s\n' "$C_B" "$C_R" "$path"
-    local main; main=$(main_activity "$pkg")
+    printf '%spath%s       %s\n' "$C_B" "$C_R" "${path:-?}"
+    local main; main=$(main_activity "$pkg" "$dump")
     [[ -n $main ]] && printf '%slauncher%s   %s\n' "$C_B" "$C_R" "$main"
     if s test -f "$IFW_DIR/$pkg.xml"; then
         printf '%sifw%s        %s\n' "$C_B" "$C_R" "$IFW_DIR/$pkg.xml"
@@ -243,7 +252,11 @@ act_unhide() {
 }
 act_suspend() {
     local pkg=$1 onoff=${2:-true}
-    s pm suspend --user 0 "$pkg" "$onoff" 2>&1 || s pm suspend "$pkg"
+    if [[ $onoff == false ]]; then
+        s pm unsuspend --user 0 "$pkg" 2>&1 || s pm unsuspend "$pkg"
+    else
+        s pm suspend --user 0 "$pkg" 2>&1 || s pm suspend "$pkg"
+    fi
 }
 
 act_disable_component() {
@@ -255,8 +268,8 @@ act_enable_component() {
     s pm enable "$comp"
 }
 
-act_force_stop() { s am force-stop "$1"; }
-act_kill()       { s am kill "$1"; }
+act_force_stop() { s /system/bin/am force-stop "$1" 2>/dev/null || s /system/bin/am stop-app "$1"; }
+act_kill()       { s /system/bin/am kill "$1"; }
 act_clear()      { s pm clear "$1"; }
 
 act_uninstall() {
@@ -373,7 +386,7 @@ act_settings() {
 #   kind:  runtime | install | requested
 _perm_table() {
     local pkg=$1
-    s dumpsys package "$pkg" 2>/dev/null | awk '
+    _pkg_dump "$pkg" | awk '
         /^    User 0:/ { u0=1; next }
         u0 && /^    User [0-9]+:/ { u0=0 }
         u0 && /^      runtime permissions:/ { sect="runtime"; next }
@@ -384,7 +397,7 @@ _perm_table() {
             print state "\t" perm "\truntime"
             next
         }
-        /^    install permissions:/ { sect="install"; next }
+        !seen_install && /^    install permissions:/ { sect="install"; seen_install=1; next }
         sect=="install" && /^    [A-Za-z]/ { sect="" }
         sect=="install" && /granted=/ && !/userId=/ {
             perm=$1; sub(/:$/, "", perm)
@@ -401,13 +414,10 @@ _perm_table() {
     '
 }
 
-# pretty-print perms (granted first, then denied, then declared-only)
-act_perms() {
-    local pkg=$1 tbl declared
-    tbl=$(_perm_table "$pkg")
-    [[ -z $tbl ]] && { warn "no permissions found for $pkg"; return 1; }
+# pretty-print a pre-fetched perm table (used by both act_perms and act_perm_manage)
+_display_perms() {
+    local tbl=$1 declared req_only
 
-    # perms appearing in runtime/install
     declared=$(awk -F'\t' '$3!="requested"{print $2}' <<<"$tbl" | sort -u)
 
     printf '%s== runtime ==%s\n' "$C_B$C_CYN" "$C_R"
@@ -428,8 +438,6 @@ act_perms() {
         fi
     done
 
-    # requested-but-unresolved (in manifest but not in runtime/install table)
-    local req_only
     req_only=$(comm -23 \
         <(awk -F'\t' '$3=="requested"{print $2}' <<<"$tbl" | sort -u) \
         <(printf '%s\n' "$declared"))
@@ -440,6 +448,13 @@ act_perms() {
             printf '  %s[?]%s %s\n' "$C_YEL" "$C_R" "$perm"
         done <<<"$req_only"
     fi
+}
+
+act_perms() {
+    local pkg=$1 tbl
+    tbl=$(_perm_table "$pkg")
+    [[ -z $tbl ]] && { warn "no permissions found for $pkg"; return 1; }
+    _display_perms "$tbl"
 }
 
 # pick a runtime perm; arg $2 filters: granted|denied|all (default all)
@@ -457,26 +472,32 @@ _pick_runtime_perm() {
 }
 
 act_grant() {
-    local pkg=$1 perm=${2-}
+    local pkg=$1 perm=${2-} out
     if [[ -z $perm ]]; then
         perm=$(_pick_runtime_perm "$pkg" denied) || return 1
     fi
-    s pm grant "$pkg" "$perm" && ok "granted $perm"
+    out=$(s pm grant "$pkg" "$perm" 2>&1) && ok "granted $perm" \
+        || err "grant failed: $(sed -n 's/.*Exception: //p' <<<"$out" | head -1)"
 }
 act_revoke() {
-    local pkg=$1 perm=${2-}
+    local pkg=$1 perm=${2-} out
     if [[ -z $perm ]]; then
         perm=$(_pick_runtime_perm "$pkg" granted) || return 1
     fi
-    s pm revoke "$pkg" "$perm" && ok "revoked $perm"
+    out=$(s pm revoke "$pkg" "$perm" 2>&1) && ok "revoked $perm" \
+        || err "revoke failed: $(sed -n 's/.*Exception: //p' <<<"$out" | head -1)"
 }
 
-# interactive permission manager: pick, toggle, repeat
+# interactive permission manager: show full display, pick, toggle, repeat
 act_perm_manage() {
-    local pkg=$1 sel state perm
+    local pkg=$1 sel state perm tbl
     while :; do
-        sel=$(_perm_table "$pkg" | awk -F'\t' '$3=="runtime"{
-            tag=($1=="granted")?"[G]":"[ ]"; printf "%s %s\n",tag,$2 }' \
+        tbl=$(_perm_table "$pkg")
+        [[ -z $tbl ]] && { warn "no permissions found for $pkg"; return 1; }
+        _display_perms "$tbl"
+        printf '\n'
+        sel=$(awk -F'\t' '$3=="runtime"{
+            tag=($1=="granted")?"[G]":"[ ]"; printf "%s %s\n",tag,$2 }' <<<"$tbl" \
             | sort | pick_one "perm to toggle (esc/q to quit)") || return 0
         state=${sel%% *}; perm=${sel##* }
         if [[ $state == "[G]" ]]; then
@@ -900,7 +921,7 @@ ${C_B}commands${C_R}
   providers  <pkg>                 alias for: components <pkg> provider
 
   enable      <pkg>                pm enable
-  disable     <pkg>                pm disable-user --user 0
+  disable     <pkg> [--full]       pm disable-user --user 0 (or full disable)
   hide        <pkg>                pm hide
   unhide      <pkg>                pm unhide
   suspend     <pkg> [true|false]   pm suspend
@@ -991,7 +1012,9 @@ dispatch() {
         providers|prov)   act_components "$(resolve_pkg "${1-}")" provider ;;
 
         enable)      act_enable_pkg  "$(resolve_pkg "${1-}")" ;;
-        disable)     act_disable_pkg "$(resolve_pkg "${1-}")" ;;
+        disable)     local _dpkg; _dpkg=$(resolve_pkg "${1-}")
+                     if [[ ${2-} == --full ]]; then s pm disable "$_dpkg"
+                     else act_disable_pkg "$_dpkg"; fi ;;
         hide)        act_hide        "$(resolve_pkg "${1-}")" ;;
         unhide)      act_unhide      "$(resolve_pkg "${1-}")" ;;
         suspend)     act_suspend     "$(resolve_pkg "${1-}")" "${2:-true}" ;;
@@ -1092,9 +1115,10 @@ EOF
             3)  act_pick_activity "$pkg" ;;
             4)  local k; k=$(printf 'all\nactivity\nreceiver\nservice\nprovider\n' | pick_one "kind") || continue
                 list_components "$pkg" "$k" | ${PAGER:-less -RFX} ;;
-            5)  local s2; s2=$(printf 'disable\nenable\nhide\nunhide\nsuspend on\nsuspend off\n' | pick_one "state") || continue
+            5)  local s2; s2=$(printf 'disable (user 0)\ndisable (full)\nenable\nhide\nunhide\nsuspend on\nsuspend off\n' | pick_one "state") || continue
                 case $s2 in
-                    disable)     act_disable_pkg "$pkg" ;;
+                    "disable (user 0)") act_disable_pkg "$pkg" ;;
+                    "disable (full)")   s pm disable "$pkg" ;;
                     enable)      act_enable_pkg  "$pkg" ;;
                     hide)        act_hide   "$pkg" ;;
                     unhide)      act_unhide "$pkg" ;;
@@ -1116,7 +1140,8 @@ EOF
             8)  read -rp "really uninstall $pkg? [y/N] " yn </dev/tty
                 [[ $yn == y* ]] || continue
                 read -rp "keep data? [y/N] " kd </dev/tty
-                [[ $kd == y* ]] && act_uninstall "$pkg" 1 || act_uninstall "$pkg" 0
+                if [[ $kd == y* ]]; then act_uninstall "$pkg" 1
+                else act_uninstall "$pkg" 0; fi
                 return 0 ;;
             9)  read -rp "dest dir [$EXTRACT_DEFAULT]: " d </dev/tty
                 act_extract "$pkg" "${d:-$EXTRACT_DEFAULT}" ;;
@@ -1161,9 +1186,8 @@ interactive() {
         read -rp "package (partial ok, blank to list, q quit): " pkg </dev/tty || break
         [[ $pkg == q || $pkg == Q ]] && break
         pkg=$(pick_pkg "$pkg") || continue
-        menu_for_pkg "$pkg" || continue
-        # menu returned 0 → quit; 1 → loop back to picker
-        case $? in 0) break ;; esac
+        menu_for_pkg "$pkg"
+        case $? in 1) continue ;; *) break ;; esac
     done
     ok "bye"
 }

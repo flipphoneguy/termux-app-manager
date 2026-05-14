@@ -55,7 +55,7 @@ tam extract com.termux ~/apks
 
 ### Lifecycle / state
 
-- `enable` / `disable` (uses `disable-user --user 0`)
+- `enable` / `disable [--full]` (default: `disable-user --user 0`; `--full`: system-level `pm disable`)
 - `hide` / `unhide` / `suspend [true|false]`
 - `force-stop` / `kill` / `clear` (wipes data)
 - `uninstall <pkg> [-k]` (-k keeps data) / `install <apk>`
@@ -67,7 +67,7 @@ tam extract com.termux ~/apks
 ### Permissions
 
 - `perms <pkg>` — pretty list, grouped: runtime / install (auto) / declared-only
-- `perm <pkg>` — interactive picker, toggles state, loops until quit
+- `perm <pkg>` — shows full grouped perms display, then interactive toggle loop
 - `grant  <pkg> [perm]` — picker over denied if perm omitted
 - `revoke <pkg> [perm]` — picker over granted if perm omitted
 
