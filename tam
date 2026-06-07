@@ -580,10 +580,22 @@ act_a11y() {
         ""|list)  a11y_list ;;
         on)       s settings put secure accessibility_enabled 1 && ok "a11y master: on" ;;
         off)      s settings put secure accessibility_enabled 0 && ok "a11y master: off" ;;
-        enable)   [[ $arg == */* ]] || arg=$(a11y_all_services | pick_one "service") || return 1
+        enable)   if [[ -z $arg ]]; then
+                      arg=$(a11y_all_services | pick_one "service") || return 1
+                  elif [[ $arg != */* ]]; then
+                      local pkg; pkg=$(resolve_pkg "$arg") || return 1
+                      local svcs; svcs=$(a11y_pkg_services "$pkg")
+                      [[ -z $svcs ]] && { warn "$pkg declares no accessibility services"; return 1; }
+                      arg=$(pick_one "service" <<<"$svcs") || return 1
+                  fi
                   a11y_enable  "$arg" ;;
         disable)  if [[ -z $arg ]]; then
                       arg=$(a11y_get_enabled | pick_one "service to disable") || return 1
+                  elif [[ $arg != */* ]]; then
+                      local pkg; pkg=$(resolve_pkg "$arg") || return 1
+                      local svcs; svcs=$(a11y_pkg_services "$pkg")
+                      [[ -z $svcs ]] && { warn "$pkg declares no accessibility services"; return 1; }
+                      arg=$(pick_one "service" <<<"$svcs") || return 1
                   fi
                   a11y_disable "$arg" ;;
         toggle)   # interactive: pick any service, flip its state

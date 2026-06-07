@@ -78,7 +78,7 @@ Manages `secure enabled_accessibility_services` and the master
 
 - `a11y` — list enabled and available services
 - `a11y on` / `a11y off` — master switch
-- `a11y enable [pkg/comp]` / `a11y disable [pkg/comp]` (picker if omitted)
+- `a11y enable [pkg|pkg/comp]` / `a11y disable [pkg|pkg/comp]` (resolves partial names; picker if omitted)
 - `a11y toggle` — pick any service, flip its state
 - `a11y <pkg>` — pick & toggle services declared by `<pkg>`
 
