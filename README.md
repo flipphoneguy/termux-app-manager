@@ -57,7 +57,7 @@ tam extract com.termux ~/apks
 
 - `enable` / `disable [--full]` (default: `disable-user --user 0`; `--full`: system-level `pm disable`)
 - `hide` / `unhide` / `suspend [true|false]`
-- `force-stop` / `kill` / `clear` (wipes data)
+- `stop` (alias `fs`) / `kill` / `clear` (wipes data)
 - `uninstall <pkg> [-k]` (-k keeps data) / `install <apk>`
 
 ### Extraction

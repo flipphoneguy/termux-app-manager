@@ -25,15 +25,59 @@ warn() { printf '%s! %s%s\n' "$C_YEL" "$*" "$C_R" >&2; }
 err()  { printf '%s✗ %s%s\n' "$C_RED" "$*" "$C_R" >&2; }
 die()  { err "$*"; exit 1; }
 
-# ---------- sudo ----------
+# ---------- root shell ----------
+# One persistent root shell fed over a pipe, instead of spawning sudo per call.
+# stdout/stderr/exit are captured via shared temp files (root writes, we read).
 have_sudo=0
-ensure_sudo() {
+_root_in= _root_ctl= _root_out_f= _root_err_f= _root_pid=
+
+_root_cleanup() {
+    [[ -n $_root_in ]] && exec {_root_in}>&- 2>/dev/null
+    [[ -n $_root_out_f ]] && rm -f "$_root_out_f" "$_root_err_f" 2>/dev/null
+}
+
+start_root() {
     (( have_sudo )) && return 0
     command -v sudo >/dev/null || die "sudo not found (install tsu/sudo)"
-    sudo -n true 2>/dev/null || sudo true || die "sudo failed"
     have_sudo=1
+
+    _root_out_f=$(mktemp) && _root_err_f=$(mktemp) || die "mktemp failed"
+    local cf af probe
+    cf=$(mktemp -u) af=$(mktemp -u)
+    if mkfifo "$cf" "$af" 2>/dev/null; then
+        sudo sh <"$cf" >"$af" 2>/dev/null &
+        _root_pid=$!
+        exec {_root_in}>"$cf"      # high fds, inherited by subshells
+        exec {_root_ctl}<"$af"
+        rm -f "$cf" "$af"
+        trap _root_cleanup EXIT
+        # one round-trip to confirm root (no extra sudo spawn)
+        printf 'echo __ok__\n' >&"$_root_in"
+        IFS= read -t 15 -ru "$_root_ctl" probe
+        [[ $probe == __ok__ ]] || die "root shell failed (sudo denied?)"
+    else
+        warn "mkfifo unavailable; falling back to per-call sudo"
+        sudo -n true 2>/dev/null || sudo true || die "sudo failed"
+        _root_in=
+    fi
 }
-s() { ensure_sudo; sudo "$@"; }
+ensure_sudo() { start_root; }
+
+# s <cmd...> — run as root, preserving stdout, stderr and exit code (binary-safe)
+# stdin is /dev/null so `cmd`/`pm` don't try to pass the control fifo over binder
+s() {
+    start_root
+    if [[ -z $_root_in ]]; then sudo "$@"; return; fi
+    local cmd qout qerr code
+    printf -v cmd  '%q ' "$@"
+    printf -v qout '%q' "$_root_out_f"
+    printf -v qerr '%q' "$_root_err_f"
+    printf '%s < /dev/null > %s 2> %s; echo "$?"\n' "$cmd" "$qout" "$qerr" >&"$_root_in"
+    IFS= read -ru "$_root_ctl" code
+    [[ -s $_root_err_f ]] && cat "$_root_err_f" >&2
+    cat "$_root_out_f"
+    return "${code:-1}"
+}
 
 # dumpsys package is ~6x faster than pm dump; fall back for non-standard ROMs
 _pkg_dump() { s dumpsys package "$1" 2>/dev/null || s pm dump "$1" 2>/dev/null; }
@@ -583,7 +627,7 @@ act_a11y() {
         enable)   if [[ -z $arg ]]; then
                       arg=$(a11y_all_services | pick_one "service") || return 1
                   elif [[ $arg != */* ]]; then
-                      local pkg; pkg=$(resolve_pkg "$arg") || return 1
+                      local pkg; pkg=$(pick_pkg "$arg") || return 1
                       local svcs; svcs=$(a11y_pkg_services "$pkg")
                       [[ -z $svcs ]] && { warn "$pkg declares no accessibility services"; return 1; }
                       arg=$(pick_one "service" <<<"$svcs") || return 1
@@ -592,7 +636,7 @@ act_a11y() {
         disable)  if [[ -z $arg ]]; then
                       arg=$(a11y_get_enabled | pick_one "service to disable") || return 1
                   elif [[ $arg != */* ]]; then
-                      local pkg; pkg=$(resolve_pkg "$arg") || return 1
+                      local pkg; pkg=$(pick_pkg "$arg") || return 1
                       local svcs; svcs=$(a11y_pkg_services "$pkg")
                       [[ -z $svcs ]] && { warn "$pkg declares no accessibility services"; return 1; }
                       arg=$(pick_one "service" <<<"$svcs") || return 1
@@ -611,7 +655,7 @@ act_a11y() {
                   else a11y_enable "$comp"; fi ;;
         *)        # treat as a package name → list/pick services for that pkg
                   local pkg svcs
-                  pkg=$(resolve_pkg "$sub")
+                  pkg=$(pick_pkg "$sub") || return 1
                   svcs=$(a11y_pkg_services "$pkg")
                   [[ -z $svcs ]] && { warn "$pkg declares no accessibility services"; return 0; }
                   local cur merged
@@ -737,23 +781,25 @@ act_batt() {
             ;;
         status)
             [[ -n $arg ]] || die "need pkg"
-            batt_status "$(resolve_pkg "$arg")"
+            local pkg; pkg=$(pick_pkg "$arg") || return 1
+            batt_status "$pkg"
             ;;
         add|exempt)
             [[ -n $arg ]] || die "need pkg"
-            batt_add "$(resolve_pkg "$arg")"
+            local pkg; pkg=$(pick_pkg "$arg") || return 1
+            batt_add "$pkg"
             ;;
         remove|rm|optimise|optimize)
             local pkg
             if [[ -z $arg ]]; then
                 pkg=$(batt_list_user | pick_one "remove from whitelist") || return 1
             else
-                pkg=$(resolve_pkg "$arg")
+                pkg=$(pick_pkg "$arg") || return 1
             fi
             batt_remove "$pkg"
             ;;
         toggle)
-            local pkg=$(resolve_pkg "$arg")
+            local pkg; pkg=$(pick_pkg "$arg") || return 1
             if s dumpsys deviceidle whitelist 2>/dev/null | awk -F, '$1=="user"{print $2}' | grep -qx "$pkg"; then
                 batt_remove "$pkg"
             else
@@ -939,7 +985,7 @@ ${C_B}commands${C_R}
   suspend     <pkg> [true|false]   pm suspend
   enable-c    <pkg/comp>           enable a component
   disable-c   <pkg/comp>           disable a component
-  force-stop  <pkg>                am force-stop
+  stop        <pkg>                am force-stop (alias: fs)
   kill        <pkg>                am kill
   clear       <pkg>                pm clear (wipes data)
 
@@ -986,10 +1032,12 @@ ${C_B}env${C_R}
 EOF
 }
 
-# resolve_pkg <maybe-partial>  → echoes resolved package
-resolve_pkg() {
-    local arg=${1-}
-    pick_pkg "$arg"
+# rp <maybe-partial> — resolve a package into global $REPLY; abort on failure.
+# Must run in the main shell (not $(...)) so a failed pick stops the command
+# instead of silently passing an empty package downstream.
+rp() {
+    REPLY=$(pick_pkg "${1-}") || exit 1
+    [[ -n $REPLY ]] || die "no package: ${1-}"
 }
 
 cmd_list() {
@@ -1009,54 +1057,54 @@ dispatch() {
 
         list)        cmd_list "$@" ;;
         search)      [[ $# -ge 1 ]] || die "need partial"; pm_list | grep -i -- "$1" ;;
-        info)        act_info "$(resolve_pkg "${1-}")" ;;
-        path)        act_path "$(resolve_pkg "${1-}")" ;;
+        info)        rp "${1-}"; act_info "$REPLY" ;;
+        path)        rp "${1-}"; act_path "$REPLY" ;;
 
-        launch)      act_launch     "$(resolve_pkg "${1-}")" ;;
-        open)        act_pick_activity "$(resolve_pkg "${1-}")" ;;
+        launch)      rp "${1-}"; act_launch "$REPLY" ;;
+        open)        rp "${1-}"; act_pick_activity "$REPLY" ;;
         start)       [[ ${1-} == */* ]] || die "need pkg/component"; s am start -n "$1" ;;
-        settings)    act_settings   "$(resolve_pkg "${1-}")" ;;
+        settings)    rp "${1-}"; act_settings "$REPLY" ;;
 
-        components|comp)  act_components "$(resolve_pkg "${1-}")" "${2:-all}" ;;
-        activities|act)   act_components "$(resolve_pkg "${1-}")" activity ;;
-        services|svc)     act_components "$(resolve_pkg "${1-}")" service ;;
-        receivers|recv)   act_components "$(resolve_pkg "${1-}")" receiver ;;
-        providers|prov)   act_components "$(resolve_pkg "${1-}")" provider ;;
+        components|comp)  rp "${1-}"; act_components "$REPLY" "${2:-all}" ;;
+        activities|act)   rp "${1-}"; act_components "$REPLY" activity ;;
+        services|svc)     rp "${1-}"; act_components "$REPLY" service ;;
+        receivers|recv)   rp "${1-}"; act_components "$REPLY" receiver ;;
+        providers|prov)   rp "${1-}"; act_components "$REPLY" provider ;;
 
-        enable)      act_enable_pkg  "$(resolve_pkg "${1-}")" ;;
-        disable)     local _dpkg; _dpkg=$(resolve_pkg "${1-}")
-                     if [[ ${2-} == --full ]]; then s pm disable "$_dpkg"
-                     else act_disable_pkg "$_dpkg"; fi ;;
-        hide)        act_hide        "$(resolve_pkg "${1-}")" ;;
-        unhide)      act_unhide      "$(resolve_pkg "${1-}")" ;;
-        suspend)     act_suspend     "$(resolve_pkg "${1-}")" "${2:-true}" ;;
+        enable)      rp "${1-}"; act_enable_pkg "$REPLY" ;;
+        disable)     rp "${1-}"
+                     if [[ ${2-} == --full ]]; then s pm disable "$REPLY"
+                     else act_disable_pkg "$REPLY"; fi ;;
+        hide)        rp "${1-}"; act_hide "$REPLY" ;;
+        unhide)      rp "${1-}"; act_unhide "$REPLY" ;;
+        suspend)     rp "${1-}"; act_suspend "$REPLY" "${2:-true}" ;;
         enable-c)    [[ ${1-} == */* ]] || die "need pkg/component"; act_enable_component "$1" ;;
         disable-c)   [[ ${1-} == */* ]] || die "need pkg/component"; act_disable_component "$1" ;;
 
-        force-stop|fs) act_force_stop "$(resolve_pkg "${1-}")" ;;
-        kill)        act_kill        "$(resolve_pkg "${1-}")" ;;
-        clear)       act_clear       "$(resolve_pkg "${1-}")" ;;
+        stop|fs)     rp "${1-}"; act_force_stop "$REPLY" ;;
+        kill)        rp "${1-}"; act_kill "$REPLY" ;;
+        clear)       rp "${1-}"; act_clear "$REPLY" ;;
 
         uninstall|rm)
             local pkg keep=0 user_only=0
             for a in "$@"; do
                 case $a in -k) keep=1 ;; --user) user_only=1 ;; *) pkg=$a ;; esac
             done
-            act_uninstall "$(resolve_pkg "$pkg")" "$keep" "$user_only" ;;
+            rp "$pkg"; act_uninstall "$REPLY" "$keep" "$user_only" ;;
         install)     [[ -n ${1-} ]] || die "need apk/dir"; act_install "$1" ;;
 
         extract|pull)
-            local pkg=$1 dest=${2:-$EXTRACT_DEFAULT}
-            act_extract "$(resolve_pkg "$pkg")" "$dest" ;;
+            local dest=${2:-$EXTRACT_DEFAULT}
+            rp "${1-}"; act_extract "$REPLY" "$dest" ;;
 
-        perms)       act_perms        "$(resolve_pkg "${1-}")" ;;
-        perm)        act_perm_manage  "$(resolve_pkg "${1-}")" ;;
-        grant)       act_grant        "$(resolve_pkg "${1-}")" "${2-}" ;;
-        revoke)      act_revoke       "$(resolve_pkg "${1-}")" "${2-}" ;;
+        perms)       rp "${1-}"; act_perms "$REPLY" ;;
+        perm)        rp "${1-}"; act_perm_manage "$REPLY" ;;
+        grant)       rp "${1-}"; act_grant "$REPLY" "${2-}" ;;
+        revoke)      rp "${1-}"; act_revoke "$REPLY" "${2-}" ;;
         a11y)        act_a11y "$@" ;;
 
         appops)
-            local pkg=$(resolve_pkg "${1-}")
+            rp "${1-}"; local pkg=$REPLY
             if [[ -z ${2-} ]]; then
                 act_appops "$pkg"
             elif [[ ${2-} == pick ]]; then
@@ -1066,11 +1114,11 @@ dispatch() {
             fi ;;
 
         batt|battery) act_batt "$@" ;;
-        size|du)      act_size "$(resolve_pkg "${1-}")" ;;
+        size|du)      rp "${1-}"; act_size "$REPLY" ;;
 
         ifw-block)
             local pkg comp
-            pkg=$(resolve_pkg "${1-}")
+            rp "${1-}"; pkg=$REPLY
             if [[ -n ${2-} ]]; then
                 comp=$2
             else
@@ -1079,7 +1127,8 @@ dispatch() {
             fi
             ifw_block "$pkg" "$comp" ;;
         ifw-unblock)
-            local pkg=$(resolve_pkg "${1-}") comp
+            local pkg comp
+            rp "${1-}"; pkg=$REPLY
             if [[ -n ${2-} ]]; then
                 comp=$2
             else
@@ -1088,7 +1137,7 @@ dispatch() {
             fi
             ifw_unblock "$pkg" "$comp" ;;
         ifw-list)    ifw_list "${1-}" ;;
-        ifw-clear)   ifw_clear "$(resolve_pkg "${1-}")" ;;
+        ifw-clear)   rp "${1-}"; ifw_clear "$REPLY" ;;
 
         *) err "unknown command: $cmd"; usage; return 2 ;;
     esac
@@ -1106,7 +1155,7 @@ menu_for_pkg() {
   ${C_DIM}4${C_R}  list components
   ${C_DIM}5${C_R}  disable / enable package
   ${C_DIM}6${C_R}  disable / enable component
-  ${C_DIM}7${C_R}  force-stop / clear data
+  ${C_DIM}7${C_R}  stop / clear data
   ${C_DIM}8${C_R}  uninstall
   ${C_DIM}9${C_R}  extract APK(s)
   ${C_DIM}10${C_R} permissions (perms / a11y / app-ops)
@@ -1143,8 +1192,8 @@ EOF
                 comp=${comp%% *}
                 if [[ $action == disable ]]; then act_disable_component "$comp"
                 else act_enable_component "$comp"; fi ;;
-            7)  local a; a=$(printf 'force-stop\nkill\nclear\n' | pick_one "action") || continue
-                case $a in force-stop) act_force_stop "$pkg" ;;
+            7)  local a; a=$(printf 'stop\nkill\nclear\n' | pick_one "action") || continue
+                case $a in stop)       act_force_stop "$pkg" ;;
                            kill)       act_kill       "$pkg" ;;
                            clear)      read -rp "really clear data for $pkg? [y/N] " yn </dev/tty
                                        [[ $yn == y* ]] && act_clear "$pkg" ;;
